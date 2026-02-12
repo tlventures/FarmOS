@@ -582,51 +582,662 @@ class LeafDetectionAnalyzer : ImageAnalysis.Analyzer {
 
 ### Voice Interface Integration
 
-#### Bhashini API Integration
+#### Voice Interface Integration (AWS Transcribe/Polly + Bhashini Fallback)
+
+**Primary: Amazon Transcribe and Polly**
+
+```kotlin
+class AWSVoiceService(
+    private val transcribeClient: TranscribeClient,
+    private val pollyClient: PollyClient,
+    private val s3Client: S3Client
+) {
+    
+    suspend fun speechToText(
+        audioData: ByteArray,
+        languageCode: String  // hi-IN, mr-IN, ta-IN, te-IN, kn-IN, bn-IN
+    ): SpeechToTextResponse {
+        // Upload audio to S3
+        val audioKey = "audio/${UUID.randomUUID()}.wav"
+        s3Client.putObject {
+            bucket = "agriedge-audio"
+            key = audioKey
+            body = ByteStream.fromBytes(audioData)
+        }
+        
+        // Start transcription job
+        val jobName = "transcribe-${UUID.randomUUID()}"
+        transcribeClient.startTranscriptionJob {
+            transcriptionJobName = jobName
+            languageCode = languageCode
+            mediaFormat = MediaFormat.Wav
+            media {
+                mediaFileUri = "s3://agriedge-audio/$audioKey"
+            }
+        }
+        
+        // Poll for completion
+        val result = waitForTranscriptionComplete(jobName)
+        
+        return SpeechToTextResponse(
+            transcript = result.transcript,
+            confidence = result.confidence
+        )
+    }
+    
+    suspend fun textToSpeech(
+        text: String,
+        languageCode: String,
+        voiceId: String = getVoiceForLanguage(languageCode)
+    ): TextToSpeechResponse {
+        val response = pollyClient.synthesizeSpeech {
+            this.text = text
+            this.voiceId = VoiceId.fromValue(voiceId)
+            this.outputFormat = OutputFormat.Mp3
+            this.languageCode = languageCode
+        }
+        
+        return TextToSpeechResponse(
+            audioContent = response.audioStream?.readBytes()?.encodeBase64() ?: "",
+            audioFormat = "mp3"
+        )
+    }
+    
+    private fun getVoiceForLanguage(languageCode: String): String {
+        return when (languageCode) {
+            "hi-IN" -> "Aditi"  // Hindi
+            "mr-IN" -> "Aditi"  // Marathi (uses Hindi voice)
+            "ta-IN" -> "Aditi"  // Tamil (neural voice)
+            "te-IN" -> "Aditi"  // Telugu (neural voice)
+            "kn-IN" -> "Aditi"  // Kannada (neural voice)
+            "bn-IN" -> "Aditi"  // Bengali (neural voice)
+            else -> "Aditi"
+        }
+    }
+}
+
+data class SpeechToTextResponse(
+    val transcript: String,
+    val confidence: Float
+)
+
+data class TextToSpeechResponse(
+    val audioContent: String,  // Base64 encoded audio
+    val audioFormat: String
+)
+```
+
+**Fallback: Bhashini API**
 
 ```kotlin
 interface BhashiniService {
     
     @POST("v1/speech-to-text")
     suspend fun speechToText(
-        @Body request: SpeechToTextRequest
-    ): SpeechToTextResponse
+        @Body request: BhashiniSpeechToTextRequest
+    ): BhashiniSpeechToTextResponse
     
     @POST("v1/text-to-speech")
     suspend fun textToSpeech(
-        @Body request: TextToSpeechRequest
-    ): TextToSpeechResponse
-    
-    @POST("v1/translate")
-    suspend fun translate(
-        @Body request: TranslationRequest
-    ): TranslationResponse
+        @Body request: BhashiniTextToSpeechRequest
+    ): BhashiniTextToSpeechResponse
 }
 
-data class SpeechToTextRequest(
-    val audioContent: String,  // Base64 encoded audio
-    val languageCode: String,  // hi-IN, mr-IN, ta-IN, etc.
+// Bhashini request/response models
+data class BhashiniSpeechToTextRequest(
+    val audioContent: String,
+    val languageCode: String,
     val encoding: AudioEncoding,
     val sampleRateHertz: Int
 )
 
-data class SpeechToTextResponse(
+data class BhashiniSpeechToTextResponse(
     val transcript: String,
     val confidence: Float,
     val alternatives: List<Alternative>
 )
+```
 
-data class TextToSpeechRequest(
-    val text: String,
-    val languageCode: String,
-    val voiceGender: VoiceGender,
-    val speakingRate: Float = 1.0f
+**Voice Service with Fallback**
+
+```kotlin
+class VoiceInterfaceManager(
+    private val awsVoiceService: AWSVoiceService,
+    private val bhashiniService: BhashiniService
+) {
+    
+    suspend fun speechToText(
+        audioData: ByteArray,
+        languageCode: String
+    ): SpeechToTextResponse {
+        return try {
+            // Try AWS Transcribe first
+            awsVoiceService.speechToText(audioData, languageCode)
+        } catch (e: Exception) {
+            // Fallback to Bhashini
+            Log.w("VoiceInterface", "AWS Transcribe failed, using Bhashini fallback", e)
+            val bhashiniResponse = bhashiniService.speechToText(
+                BhashiniSpeechToTextRequest(
+                    audioContent = audioData.encodeBase64(),
+                    languageCode = languageCode,
+                    encoding = AudioEncoding.LINEAR16,
+                    sampleRateHertz = 16000
+                )
+            )
+            SpeechToTextResponse(
+                transcript = bhashiniResponse.transcript,
+                confidence = bhashiniResponse.confidence
+            )
+        }
+    }
+    
+    suspend fun textToSpeech(
+        text: String,
+        languageCode: String
+    ): TextToSpeechResponse {
+        return try {
+            // Try AWS Polly first
+            awsVoiceService.textToSpeech(text, languageCode)
+        } catch (e: Exception) {
+            // Fallback to Bhashini
+            Log.w("VoiceInterface", "AWS Polly failed, using Bhashini fallback", e)
+            val bhashiniResponse = bhashiniService.textToSpeech(
+                BhashiniTextToSpeechRequest(
+                    text = text,
+                    languageCode = languageCode,
+                    voiceGender = VoiceGender.FEMALE,
+                    speakingRate = 1.0f
+                )
+            )
+            TextToSpeechResponse(
+                audioContent = bhashiniResponse.audioContent,
+                audioFormat = "mp3"
+            )
+        }
+    }
+}
+```
+
+### Amazon Bedrock Integration (Treatment Recommendations)
+
+**Using Claude 3 or Titan for Treatment Generation**
+
+```python
+# Backend Lambda function
+import boto3
+import json
+
+bedrock_runtime = boto3.client('bedrock-runtime', region_name='us-east-1')
+
+def generate_treatment_recommendation(disease_id: str, crop_type: str, language: str) -> dict:
+    """
+    Generate treatment recommendations using Amazon Bedrock (Claude 3)
+    """
+    
+    # Construct prompt with agricultural knowledge
+    prompt = f"""You are an expert agricultural advisor. Provide treatment recommendations for the following:
+
+Disease: {disease_id}
+Crop: {crop_type}
+Language: {language}
+
+Please provide:
+1. Organic treatment options with specific products and application methods
+2. Chemical treatment options with dosage and timing
+3. Preventive measures for future occurrences
+4. Expected recovery timeline
+
+Format the response in {language} language, using locally available product names in India.
+"""
+    
+    # Call Bedrock with Claude 3
+    request_body = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 2000,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        "temperature": 0.7,
+        "top_p": 0.9
+    }
+    
+    response = bedrock_runtime.invoke_model(
+        modelId="anthropic.claude-3-sonnet-20240229-v1:0",
+        body=json.dumps(request_body)
+    )
+    
+    response_body = json.loads(response['body'].read())
+    treatment_text = response_body['content'][0]['text']
+    
+    # Parse and structure the response
+    return {
+        "disease_id": disease_id,
+        "crop_type": crop_type,
+        "language": language,
+        "treatment_text": treatment_text,
+        "generated_at": datetime.now().isoformat()
+    }
+
+def lambda_handler(event, context):
+    """
+    Lambda handler for treatment recommendation generation
+    """
+    body = json.loads(event['body'])
+    
+    disease_id = body['disease_id']
+    crop_type = body['crop_type']
+    language = body.get('language', 'en-IN')
+    
+    try:
+        recommendation = generate_treatment_recommendation(disease_id, crop_type, language)
+        
+        # Cache in DynamoDB for future requests
+        dynamodb = boto3.resource('dynamodb')
+        table = dynamodb.Table('TreatmentRecommendations')
+        table.put_item(Item=recommendation)
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps(recommendation)
+        }
+    except Exception as e:
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': str(e)})
+        }
+```
+
+**Knowledge Base Integration**
+
+```python
+def create_bedrock_knowledge_base():
+    """
+    Create Amazon Bedrock Knowledge Base with agricultural documents
+    """
+    bedrock_agent = boto3.client('bedrock-agent')
+    
+    # Create knowledge base
+    response = bedrock_agent.create_knowledge_base(
+        name='AgriEdge-Agricultural-Knowledge',
+        description='Comprehensive agricultural knowledge base for crop diseases and treatments',
+        roleArn='arn:aws:iam::ACCOUNT_ID:role/BedrockKnowledgeBaseRole',
+        knowledgeBaseConfiguration={
+            'type': 'VECTOR',
+            'vectorKnowledgeBaseConfiguration': {
+                'embeddingModelArn': 'arn:aws:bedrock:us-east-1::foundation-model/amazon.titan-embed-text-v1'
+            }
+        },
+        storageConfiguration={
+            'type': 'OPENSEARCH_SERVERLESS',
+            'opensearchServerlessConfiguration': {
+                'collectionArn': 'arn:aws:aoss:us-east-1:ACCOUNT_ID:collection/agriedge-kb',
+                'vectorIndexName': 'agriedge-vector-index',
+                'fieldMapping': {
+                    'vectorField': 'embedding',
+                    'textField': 'text',
+                    'metadataField': 'metadata'
+                }
+            }
+        }
+    )
+    
+    return response['knowledgeBase']['knowledgeBaseId']
+
+def query_knowledge_base(query: str, knowledge_base_id: str) -> str:
+    """
+    Query the knowledge base for relevant agricultural information
+    """
+    bedrock_agent_runtime = boto3.client('bedrock-agent-runtime')
+    
+    response = bedrock_agent_runtime.retrieve(
+        knowledgeBaseId=knowledge_base_id,
+        retrievalQuery={
+            'text': query
+        },
+        retrievalConfiguration={
+            'vectorSearchConfiguration': {
+                'numberOfResults': 5
+            }
+        }
+    )
+    
+    # Combine retrieved documents
+    context = "\n\n".join([
+        result['content']['text'] 
+        for result in response['retrievalResults']
+    ])
+    
+    return context
+```
+
+### Amazon Q Integration (24/7 Farmer Assistant)
+
+**Amazon Q Business Application Setup**
+
+```python
+def setup_amazon_q_application():
+    """
+    Set up Amazon Q Business application for farmer assistance
+    """
+    q_business = boto3.client('qbusiness')
+    
+    # Create Q Business application
+    app_response = q_business.create_application(
+        displayName='AgriEdge Farmer Assistant',
+        description='24/7 AI assistant for farmers with agricultural expertise',
+        roleArn='arn:aws:iam::ACCOUNT_ID:role/AmazonQBusinessRole',
+        identityCenterInstanceArn='arn:aws:sso:::instance/ssoins-XXXXX'
+    )
+    
+    application_id = app_response['applicationId']
+    
+    # Create data source (S3 bucket with agricultural documents)
+    data_source_response = q_business.create_data_source(
+        applicationId=application_id,
+        indexId='index-id',
+        displayName='Agricultural Knowledge Base',
+        configuration={
+            's3Configuration': {
+                'bucketName': 'agriedge-knowledge-base',
+                'inclusionPrefixes': ['agriculture/', 'crop-diseases/', 'treatments/']
+            }
+        },
+        roleArn='arn:aws:iam::ACCOUNT_ID:role/AmazonQDataSourceRole'
+    )
+    
+    return application_id
+
+def chat_with_q_assistant(user_message: str, conversation_id: str, application_id: str) -> dict:
+    """
+    Send message to Amazon Q assistant and get response
+    """
+    q_business = boto3.client('qbusiness')
+    
+    response = q_business.chat_sync(
+        applicationId=application_id,
+        conversationId=conversation_id,
+        userMessage=user_message,
+        userGroups=['farmers'],
+        chatMode='RETRIEVAL_MODE'
+    )
+    
+    return {
+        'conversation_id': response['conversationId'],
+        'message_id': response['systemMessageId'],
+        'response_text': response['systemMessage'],
+        'source_attributions': response.get('sourceAttributions', [])
+    }
+
+def lambda_handler(event, context):
+    """
+    Lambda handler for Amazon Q chat interface
+    """
+    body = json.loads(event['body'])
+    
+    user_message = body['message']
+    conversation_id = body.get('conversation_id')
+    user_id = body['user_id']
+    language = body.get('language', 'en-IN')
+    
+    # Translate to English if needed (Q works best in English)
+    if language != 'en-IN':
+        translate = boto3.client('translate')
+        translated = translate.translate_text(
+            Text=user_message,
+            SourceLanguageCode=language.split('-')[0],
+            TargetLanguageCode='en'
+        )
+        user_message = translated['TranslatedText']
+    
+    # Get response from Q
+    q_response = chat_with_q_assistant(
+        user_message=user_message,
+        conversation_id=conversation_id or f"conv-{user_id}-{int(time.time())}",
+        application_id=os.environ['Q_APPLICATION_ID']
+    )
+    
+    # Translate response back if needed
+    response_text = q_response['response_text']
+    if language != 'en-IN':
+        translated_response = translate.translate_text(
+            Text=response_text,
+            SourceLanguageCode='en',
+            TargetLanguageCode=language.split('-')[0]
+        )
+        response_text = translated_response['TranslatedText']
+    
+    return {
+        'statusCode': 200,
+        'body': json.dumps({
+            'conversation_id': q_response['conversation_id'],
+            'response': response_text,
+            'sources': q_response['source_attributions']
+        })
+    }
+```
+
+**Android Integration with Amazon Q**
+
+```kotlin
+class AmazonQChatService(
+    private val apiClient: ApiClient
+) {
+    
+    suspend fun sendMessage(
+        message: String,
+        conversationId: String?,
+        language: String
+    ): ChatResponse {
+        val request = ChatRequest(
+            message = message,
+            conversation_id = conversationId,
+            user_id = getCurrentUserId(),
+            language = language
+        )
+        
+        return apiClient.post("/api/v1/chat/q", request)
+    }
+    
+    suspend fun getChatHistory(conversationId: String): List<ChatMessage> {
+        return apiClient.get("/api/v1/chat/q/history/$conversationId")
+    }
+}
+
+data class ChatRequest(
+    val message: String,
+    val conversation_id: String?,
+    val user_id: String,
+    val language: String
+)
+
+data class ChatResponse(
+    val conversation_id: String,
+    val response: String,
+    val sources: List<SourceAttribution>
+)
+
+data class SourceAttribution(
+    val title: String,
+    val snippet: String,
+    val url: String?
+)
+```
+
+**Primary: Amazon Transcribe and Polly**
+
+```kotlin
+class AWSVoiceService(
+    private val transcribeClient: TranscribeClient,
+    private val pollyClient: PollyClient,
+    private val s3Client: S3Client
+) {
+    
+    suspend fun speechToText(
+        audioData: ByteArray,
+        languageCode: String  // hi-IN, mr-IN, ta-IN, te-IN, kn-IN, bn-IN
+    ): SpeechToTextResponse {
+        // Upload audio to S3
+        val audioKey = "audio/${UUID.randomUUID()}.wav"
+        s3Client.putObject {
+            bucket = "agriedge-audio"
+            key = audioKey
+            body = ByteStream.fromBytes(audioData)
+        }
+        
+        // Start transcription job
+        val jobName = "transcribe-${UUID.randomUUID()}"
+        transcribeClient.startTranscriptionJob {
+            transcriptionJobName = jobName
+            languageCode = languageCode
+            mediaFormat = MediaFormat.Wav
+            media {
+                mediaFileUri = "s3://agriedge-audio/$audioKey"
+            }
+        }
+        
+        // Poll for completion
+        val result = waitForTranscriptionComplete(jobName)
+        
+        return SpeechToTextResponse(
+            transcript = result.transcript,
+            confidence = result.confidence
+        )
+    }
+    
+    suspend fun textToSpeech(
+        text: String,
+        languageCode: String,
+        voiceId: String = getVoiceForLanguage(languageCode)
+    ): TextToSpeechResponse {
+        val response = pollyClient.synthesizeSpeech {
+            this.text = text
+            this.voiceId = VoiceId.fromValue(voiceId)
+            this.outputFormat = OutputFormat.Mp3
+            this.languageCode = languageCode
+        }
+        
+        return TextToSpeechResponse(
+            audioContent = response.audioStream?.readBytes()?.encodeBase64() ?: "",
+            audioFormat = "mp3"
+        )
+    }
+    
+    private fun getVoiceForLanguage(languageCode: String): String {
+        return when (languageCode) {
+            "hi-IN" -> "Aditi"  // Hindi
+            "mr-IN" -> "Aditi"  // Marathi (uses Hindi voice)
+            "ta-IN" -> "Aditi"  // Tamil (neural voice)
+            "te-IN" -> "Aditi"  // Telugu (neural voice)
+            "kn-IN" -> "Aditi"  // Kannada (neural voice)
+            "bn-IN" -> "Aditi"  // Bengali (neural voice)
+            else -> "Aditi"
+        }
+    }
+}
+
+data class SpeechToTextResponse(
+    val transcript: String,
+    val confidence: Float
 )
 
 data class TextToSpeechResponse(
     val audioContent: String,  // Base64 encoded audio
-    val audioConfig: AudioConfig
+    val audioFormat: String
 )
+```
+
+**Fallback: Bhashini API**
+
+```kotlin
+interface BhashiniService {
+    
+    @POST("v1/speech-to-text")
+    suspend fun speechToText(
+        @Body request: BhashiniSpeechToTextRequest
+    ): BhashiniSpeechToTextResponse
+    
+    @POST("v1/text-to-speech")
+    suspend fun textToSpeech(
+        @Body request: BhashiniTextToSpeechRequest
+    ): BhashiniTextToSpeechResponse
+}
+
+// Bhashini request/response models
+data class BhashiniSpeechToTextRequest(
+    val audioContent: String,
+    val languageCode: String,
+    val encoding: AudioEncoding,
+    val sampleRateHertz: Int
+)
+
+data class BhashiniSpeechToTextResponse(
+    val transcript: String,
+    val confidence: Float,
+    val alternatives: List<Alternative>
+)
+```
+
+**Voice Service with Fallback**
+
+```kotlin
+class VoiceInterfaceManager(
+    private val awsVoiceService: AWSVoiceService,
+    private val bhashiniService: BhashiniService
+) {
+    
+    suspend fun speechToText(
+        audioData: ByteArray,
+        languageCode: String
+    ): SpeechToTextResponse {
+        return try {
+            // Try AWS Transcribe first
+            awsVoiceService.speechToText(audioData, languageCode)
+        } catch (e: Exception) {
+            // Fallback to Bhashini
+            Log.w("VoiceInterface", "AWS Transcribe failed, using Bhashini fallback", e)
+            val bhashiniResponse = bhashiniService.speechToText(
+                BhashiniSpeechToTextRequest(
+                    audioContent = audioData.encodeBase64(),
+                    languageCode = languageCode,
+                    encoding = AudioEncoding.LINEAR16,
+                    sampleRateHertz = 16000
+                )
+            )
+            SpeechToTextResponse(
+                transcript = bhashiniResponse.transcript,
+                confidence = bhashiniResponse.confidence
+            )
+        }
+    }
+    
+    suspend fun textToSpeech(
+        text: String,
+        languageCode: String
+    ): TextToSpeechResponse {
+        return try {
+            // Try AWS Polly first
+            awsVoiceService.textToSpeech(text, languageCode)
+        } catch (e: Exception) {
+            // Fallback to Bhashini
+            Log.w("VoiceInterface", "AWS Polly failed, using Bhashini fallback", e)
+            val bhashiniResponse = bhashiniService.textToSpeech(
+                BhashiniTextToSpeechRequest(
+                    text = text,
+                    languageCode = languageCode,
+                    voiceGender = VoiceGender.FEMALE,
+                    speakingRate = 1.0f
+                )
+            )
+            TextToSpeechResponse(
+                audioContent = bhashiniResponse.audioContent,
+                audioFormat = "mp3"
+            )
+        }
+    }
+}
 ```
 
 #### Voice Command Parser
@@ -1032,71 +1643,96 @@ Launch App
 ### Technology Stack
 
 #### Core Technologies
-- **Language**: Kotlin with Spring Boot 3.2+ (or Node.js with TypeScript)
-- **Framework**: Spring WebFlux (reactive) or Express.js
+- **Language**: Python 3.11+ with FastAPI or Node.js with TypeScript
+- **Framework**: FastAPI (Python) or Express.js (Node.js)
 - **API Style**: REST with JSON
 - **Authentication**: JWT with refresh tokens
+- **Compute**: AWS Lambda with API Gateway (serverless)
 
-#### Database
-- **Primary Database**: PostgreSQL 15+
-- **Caching**: Redis 7+
-- **Search**: Elasticsearch 8+ (optional, for advanced search)
+#### AWS AI/ML Services
+- **Amazon Bedrock**: Claude 3 or Titan for treatment recommendations and knowledge synthesis
+- **Amazon Q**: 24/7 farmer assistant chatbot with agricultural knowledge base
+- **Amazon Transcribe**: Speech-to-text for voice interface (supports Indian languages)
+- **Amazon Polly**: Text-to-speech for voice output (supports Indian languages)
+- **Amazon SageMaker**: Custom ML model training and deployment for demand forecasting
+- **Amazon Rekognition**: Image analysis and quality validation (optional enhancement)
 
-#### Cloud Infrastructure
-- **Cloud Provider**: AWS or Google Cloud Platform
-- **Compute**: ECS/EKS (AWS) or GKE (GCP) for containerized services
-- **Storage**: S3 (AWS) or Cloud Storage (GCP)
-- **CDN**: CloudFront (AWS) or Cloud CDN (GCP)
+#### Database & Storage
+- **Primary Database**: Amazon DynamoDB (NoSQL) for high-scale, low-latency access
+- **Relational Database**: Amazon RDS PostgreSQL for complex queries and analytics
+- **Caching**: Amazon ElastiCache (Redis) for session management and API response caching
+- **Object Storage**: Amazon S3 for diagnostic images and ML models
+- **CDN**: Amazon CloudFront for global content delivery
 
-#### Message Queue
-- **Queue**: AWS SQS or Google Cloud Pub/Sub
-- **Use Cases**: Async processing, telemetry ingestion, notifications
+#### AWS Infrastructure Services
+- **Compute**: AWS Lambda for serverless functions
+- **API Management**: Amazon API Gateway for REST APIs
+- **Message Queue**: Amazon SQS for async processing
+- **Event Bus**: Amazon EventBridge for event-driven architecture
+- **Notifications**: Amazon SNS for SMS and push notifications
+- **Secrets Management**: AWS Secrets Manager for API keys and credentials
 
 #### Monitoring & Logging
-- **Logging**: CloudWatch (AWS) or Cloud Logging (GCP)
-- **Metrics**: Prometheus + Grafana
-- **Tracing**: OpenTelemetry
-- **Error Tracking**: Sentry
+- **Logging**: Amazon CloudWatch Logs
+- **Metrics**: Amazon CloudWatch Metrics
+- **Tracing**: AWS X-Ray for distributed tracing
+- **Dashboards**: Amazon QuickSight for impact dashboards and analytics
+- **Alarms**: Amazon CloudWatch Alarms
 
 #### External Services
-- **SMS**: Twilio or AWS SNS
-- **Push Notifications**: Firebase Cloud Messaging
-- **Email**: SendGrid or AWS SES
+- **SMS**: Amazon SNS for OTP delivery
+- **Push Notifications**: Amazon SNS Mobile Push
+- **Email**: Amazon SES for transactional emails
+- **Bhashini API**: Government multilingual AI services (external integration)
 
 ### Architecture Approach
 
-**Microservices Architecture** with the following services:
+**Serverless Architecture** using AWS Lambda and managed services:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                      API Gateway                             │
-│              (Kong or AWS API Gateway)                       │
+│                  Amazon API Gateway                          │
+│              (REST API + WebSocket API)                      │
 └────────┬────────────────────────────────────────────────────┘
          │
          ├──────────────┬──────────────┬──────────────┬────────────┐
          │              │              │              │            │
     ┌────▼────┐   ┌────▼────┐   ┌────▼────┐   ┌────▼────┐  ┌───▼────┐
     │  Auth   │   │  User   │   │  Sync   │   │ Market  │  │Telemetry│
-    │ Service │   │ Profile │   │ Service │   │Connector│  │ Service │
-    │         │   │ Service │   │         │   │         │  │         │
+    │ Lambda  │   │ Profile │   │ Lambda  │   │Connector│  │ Lambda  │
+    │         │   │ Lambda  │   │         │   │ Lambda  │  │         │
     └────┬────┘   └────┬────┘   └────┬────┘   └────┬────┘  └───┬────┘
          │              │              │              │           │
          └──────────────┴──────────────┴──────────────┴───────────┘
                                   │
-                        ┌─────────▼──────────┐
-                        │   PostgreSQL       │
-                        │   (Shared or       │
-                        │   Per-Service)     │
-                        └────────────────────┘
+         ┌────────────────────────┼────────────────────────────────┐
+         │                        │                                │
+    ┌────▼────────┐    ┌─────────▼──────────┐    ┌──────────────▼──┐
+    │  DynamoDB   │    │   RDS PostgreSQL   │    │   Amazon S3     │
+    │  (NoSQL)    │    │   (Analytics)      │    │  (Images/Models)│
+    └─────────────┘    └────────────────────┘    └─────────────────┘
+         │
+         │
+    ┌────▼────────────────────────────────────────────────────────┐
+    │              AWS AI/ML Services                              │
+    │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐ │
+    │  │   Bedrock    │  │   Amazon Q   │  │ Transcribe/Polly │ │
+    │  │ (Claude/     │  │  (Chatbot)   │  │  (Voice I/O)     │ │
+    │  │  Titan)      │  │              │  │                  │ │
+    │  └──────────────┘  └──────────────┘  └──────────────────┘ │
+    └──────────────────────────────────────────────────────────────┘
 ```
 
-**Service Responsibilities**:
+**Lambda Function Responsibilities**:
 
-1. **Auth Service**: User authentication, OTP generation/verification, JWT management
-2. **User Profile Service**: User data management, preferences, location
-3. **Sync Service**: Handles data synchronization from mobile devices
-4. **Market Connector**: Beckn/ONDC integration, transaction management
-5. **Telemetry Service**: Collects and processes anonymized usage data
+1. **Auth Lambda**: User authentication, OTP generation/verification via SNS, JWT management
+2. **User Profile Lambda**: User data management in DynamoDB, preferences, location
+3. **Sync Lambda**: Handles data synchronization from mobile devices, writes to DynamoDB/S3
+4. **Market Connector Lambda**: Beckn/ONDC integration, transaction management
+5. **Telemetry Lambda**: Collects and processes anonymized usage data, writes to DynamoDB
+6. **Treatment Generator Lambda**: Uses Amazon Bedrock to generate treatment recommendations
+7. **Voice Interface Lambda**: Integrates with Transcribe/Polly for voice I/O
+8. **Q Assistant Lambda**: Handles Amazon Q chatbot interactions
 
 ### API Design
 
@@ -1621,162 +2257,275 @@ class BecknWebhookController(
 }
 ```
 
-### Database Schema (Backend)
+### Database Schema
 
-#### PostgreSQL Schema
+#### DynamoDB Tables
+
+**Users Table**
+
+```python
+# Table: Users
+# Partition Key: user_id (String)
+
+{
+    "user_id": "uuid",
+    "phone_number": "string",  # GSI partition key
+    "phone_verified": "boolean",
+    "language_code": "string",
+    "created_at": "number",  # Unix timestamp
+    "updated_at": "number",
+    "last_login_at": "number",
+    "deleted_at": "number"  # Soft delete
+}
+
+# Global Secondary Index: PhoneNumberIndex
+# Partition Key: phone_number
+```
+
+**User Profiles Table**
+
+```python
+# Table: UserProfiles
+# Partition Key: user_id (String)
+
+{
+    "user_id": "uuid",
+    "village": "string",
+    "district": "string",
+    "state": "string",
+    "latitude": "number",
+    "longitude": "number",
+    "primary_crops": ["string"],  # List of crop types
+    "last_synced_at": "number",
+    "created_at": "number",
+    "updated_at": "number"
+}
+
+# Global Secondary Index: LocationIndex
+# Partition Key: state
+# Sort Key: district
+```
+
+**Diagnoses Table**
+
+```python
+# Table: Diagnoses
+# Partition Key: user_id (String)
+# Sort Key: timestamp (Number)
+
+{
+    "user_id": "uuid",
+    "timestamp": "number",  # Unix timestamp (sort key)
+    "diagnosis_id": "uuid",  # GSI partition key
+    "crop_type": "string",
+    "disease_id": "string",
+    "disease_name": "string",
+    "confidence": "number",
+    "image_url": "string",  # S3 URL
+    "latitude": "number",
+    "longitude": "number",
+    "synced_at": "number"
+}
+
+# Global Secondary Index: DiagnosisIdIndex
+# Partition Key: diagnosis_id
+
+# Global Secondary Index: DiseaseIndex
+# Partition Key: disease_id
+# Sort Key: timestamp
+```
+
+**Transactions Table**
+
+```python
+# Table: Transactions
+# Partition Key: user_id (String)
+# Sort Key: created_at (Number)
+
+{
+    "user_id": "uuid",
+    "created_at": "number",  # Sort key
+    "transaction_id": "uuid",  # GSI partition key
+    "beckn_transaction_id": "string",
+    "transaction_type": "string",  # SALE, COLD_STORAGE, EQUIPMENT_RENTAL
+    "provider_id": "string",
+    "provider_name": "string",
+    "crop_type": "string",
+    "quantity": "number",
+    "unit": "string",
+    "price_per_unit": "number",
+    "total_amount": "number",
+    "status": "string",  # INITIATED, CONFIRMED, IN_PROGRESS, COMPLETED, CANCELLED
+    "pickup_date": "number",
+    "pickup_location": "string",
+    "updated_at": "number",
+    "completed_at": "number"
+}
+
+# Global Secondary Index: TransactionIdIndex
+# Partition Key: transaction_id
+
+# Global Secondary Index: StatusIndex
+# Partition Key: status
+# Sort Key: created_at
+```
+
+**Provider Ratings Table**
+
+```python
+# Table: ProviderRatings
+# Partition Key: provider_id (String)
+# Sort Key: created_at (Number)
+
+{
+    "provider_id": "string",
+    "created_at": "number",  # Sort key
+    "rating_id": "uuid",
+    "user_id": "uuid",
+    "transaction_id": "uuid",
+    "rating": "number",  # 1-5
+    "review_text": "string",
+    "synced_at": "number"
+}
+
+# Global Secondary Index: UserRatingsIndex
+# Partition Key: user_id
+# Sort Key: created_at
+```
+
+**Telemetry Events Table**
+
+```python
+# Table: TelemetryEvents
+# Partition Key: event_type (String)
+# Sort Key: timestamp (Number)
+
+{
+    "event_type": "string",  # Partition key
+    "timestamp": "number",  # Sort key
+    "event_id": "uuid",
+    "user_hash": "string",  # Anonymized user ID
+    "device_model": "string",
+    "os_version": "string",
+    "app_version": "string",
+    "metadata": {
+        "crop_type": "string",
+        "disease_id": "string",
+        "confidence": "number",
+        "inference_time": "number"
+    },
+    "created_at": "number"
+}
+
+# Time-to-Live (TTL) enabled on 'ttl' attribute (90 days retention)
+```
+
+**Sync Queue Table**
+
+```python
+# Table: SyncQueue
+# Partition Key: user_id (String)
+# Sort Key: timestamp (Number)
+
+{
+    "user_id": "uuid",
+    "timestamp": "number",  # Sort key
+    "sync_id": "uuid",
+    "entity_type": "string",  # DIAGNOSIS, PROFILE, RATING, TRANSACTION
+    "entity_id": "string",
+    "operation": "string",  # CREATE, UPDATE, DELETE
+    "payload": "map",  # JSON object
+    "retry_count": "number",
+    "status": "string",  # PENDING, IN_PROGRESS, FAILED, COMPLETED
+    "last_attempt_at": "number"
+}
+
+# Global Secondary Index: StatusIndex
+# Partition Key: status
+# Sort Key: timestamp
+```
+
+**Treatment Recommendations Table (Cache)**
+
+```python
+# Table: TreatmentRecommendations
+# Partition Key: disease_id (String)
+# Sort Key: language (String)
+
+{
+    "disease_id": "string",
+    "language": "string",  # Sort key
+    "crop_type": "string",
+    "treatment_text": "string",  # Generated by Bedrock
+    "organic_options": ["map"],
+    "chemical_options": ["map"],
+    "preventive_measures": ["string"],
+    "generated_at": "number",
+    "ttl": "number"  # TTL for cache expiration (30 days)
+}
+```
+
+**Beckn Search Cache Table**
+
+```python
+# Table: BecknSearchCache
+# Partition Key: transaction_id (String)
+
+{
+    "transaction_id": "string",
+    "user_id": "uuid",
+    "search_type": "string",  # BUYER, COLD_STORAGE, EQUIPMENT
+    "results": ["map"],  # Array of provider results
+    "created_at": "number",
+    "ttl": "number"  # TTL for cache expiration (1 hour)
+}
+```
+
+#### RDS PostgreSQL Schema (Analytics)
+
+For complex analytics and reporting, use RDS PostgreSQL:
 
 ```sql
--- Users table
-CREATE TABLE users (
-    user_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    phone_number VARCHAR(15) UNIQUE NOT NULL,
-    phone_verified BOOLEAN DEFAULT FALSE,
-    language_code VARCHAR(10) NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    last_login_at TIMESTAMP WITH TIME ZONE,
-    deleted_at TIMESTAMP WITH TIME ZONE
-);
-
-CREATE INDEX idx_users_phone ON users(phone_number);
-CREATE INDEX idx_users_deleted ON users(deleted_at) WHERE deleted_at IS NULL;
-
--- User profiles table
-CREATE TABLE user_profiles (
-    user_id UUID PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
-    village VARCHAR(100),
-    district VARCHAR(100),
+-- Aggregated diagnoses for analytics
+CREATE TABLE diagnosis_analytics (
+    id SERIAL PRIMARY KEY,
+    date DATE NOT NULL,
     state VARCHAR(100),
-    latitude DECIMAL(10, 8),
-    longitude DECIMAL(11, 8),
-    primary_crops TEXT[],
-    last_synced_at TIMESTAMP WITH TIME ZONE,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX idx_profiles_location ON user_profiles(latitude, longitude);
-
--- OTP table
-CREATE TABLE otp_verifications (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    phone_number VARCHAR(15) NOT NULL,
-    otp_code VARCHAR(6) NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
-    verified_at TIMESTAMP WITH TIME ZONE,
-    attempts INT DEFAULT 0
-);
-
-CREATE INDEX idx_otp_phone ON otp_verifications(phone_number);
-CREATE INDEX idx_otp_expires ON otp_verifications(expires_at);
-
--- Diagnoses table (synced from mobile)
-CREATE TABLE diagnoses (
-    diagnosis_id UUID PRIMARY KEY,
-    user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
-    timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
-    crop_type VARCHAR(50) NOT NULL,
-    disease_id VARCHAR(100) NOT NULL,
-    disease_name VARCHAR(200) NOT NULL,
-    confidence DECIMAL(5, 4) NOT NULL,
-    image_url TEXT,
-    latitude DECIMAL(10, 8),
-    longitude DECIMAL(11, 8),
-    synced_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX idx_diagnoses_user ON diagnoses(user_id);
-CREATE INDEX idx_diagnoses_timestamp ON diagnoses(timestamp);
-CREATE INDEX idx_diagnoses_disease ON diagnoses(disease_id);
-CREATE INDEX idx_diagnoses_location ON diagnoses(latitude, longitude);
-
--- Transactions table
-CREATE TABLE transactions (
-    transaction_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
-    beckn_transaction_id VARCHAR(100) UNIQUE,
-    transaction_type VARCHAR(50) NOT NULL,  -- SALE, COLD_STORAGE, EQUIPMENT_RENTAL
-    provider_id VARCHAR(100) NOT NULL,
-    provider_name VARCHAR(200) NOT NULL,
+    district VARCHAR(100),
     crop_type VARCHAR(50),
-    quantity DECIMAL(10, 2),
-    unit VARCHAR(20),
-    price_per_unit DECIMAL(10, 2),
-    total_amount DECIMAL(12, 2) NOT NULL,
-    status VARCHAR(50) NOT NULL,  -- INITIATED, CONFIRMED, IN_PROGRESS, COMPLETED, CANCELLED
-    pickup_date TIMESTAMP WITH TIME ZONE,
-    pickup_location TEXT,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    completed_at TIMESTAMP WITH TIME ZONE
+    disease_id VARCHAR(100),
+    total_diagnoses INT,
+    avg_confidence DECIMAL(5, 4),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_transactions_user ON transactions(user_id);
-CREATE INDEX idx_transactions_beckn ON transactions(beckn_transaction_id);
-CREATE INDEX idx_transactions_status ON transactions(status);
-CREATE INDEX idx_transactions_created ON transactions(created_at);
+CREATE INDEX idx_diagnosis_analytics_date ON diagnosis_analytics(date);
+CREATE INDEX idx_diagnosis_analytics_location ON diagnosis_analytics(state, district);
 
--- Provider ratings table
-CREATE TABLE provider_ratings (
-    rating_id UUID PRIMARY KEY,
-    user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
-    provider_id VARCHAR(100) NOT NULL,
-    transaction_id UUID REFERENCES transactions(transaction_id) ON DELETE CASCADE,
-    rating INT NOT NULL CHECK (rating >= 1 AND rating <= 5),
-    review_text TEXT,
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL,
-    synced_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+-- Transaction analytics
+CREATE TABLE transaction_analytics (
+    id SERIAL PRIMARY KEY,
+    date DATE NOT NULL,
+    state VARCHAR(100),
+    district VARCHAR(100),
+    transaction_type VARCHAR(50),
+    total_transactions INT,
+    total_value DECIMAL(12, 2),
+    avg_transaction_value DECIMAL(12, 2),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_ratings_provider ON provider_ratings(provider_id);
-CREATE INDEX idx_ratings_user ON provider_ratings(user_id);
-CREATE INDEX idx_ratings_transaction ON provider_ratings(transaction_id);
-
--- Telemetry events table
-CREATE TABLE telemetry_events (
-    event_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID REFERENCES users(user_id) ON DELETE SET NULL,
-    event_type VARCHAR(50) NOT NULL,
-    timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
-    device_model VARCHAR(100),
-    os_version VARCHAR(50),
-    app_version VARCHAR(20),
-    metadata JSONB,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+-- Provider performance metrics
+CREATE TABLE provider_metrics (
+    provider_id VARCHAR(100) PRIMARY KEY,
+    provider_name VARCHAR(200),
+    provider_type VARCHAR(50),
+    total_transactions INT,
+    avg_rating DECIMAL(3, 2),
+    total_reviews INT,
+    rating_distribution JSONB,
+    last_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
-
-CREATE INDEX idx_telemetry_type ON telemetry_events(event_type);
-CREATE INDEX idx_telemetry_timestamp ON telemetry_events(timestamp);
-CREATE INDEX idx_telemetry_user ON telemetry_events(user_id);
-
--- Beckn search cache (temporary storage for search results)
-CREATE TABLE beckn_search_cache (
-    cache_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    transaction_id VARCHAR(100) NOT NULL,
-    user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
-    search_type VARCHAR(50) NOT NULL,
-    results JSONB NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    expires_at TIMESTAMP WITH TIME ZONE NOT NULL
-);
-
-CREATE INDEX idx_search_cache_transaction ON beckn_search_cache(transaction_id);
-CREATE INDEX idx_search_cache_user ON beckn_search_cache(user_id);
-CREATE INDEX idx_search_cache_expires ON beckn_search_cache(expires_at);
-
--- Refresh tokens table
-CREATE TABLE refresh_tokens (
-    token_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
-    token_hash VARCHAR(255) NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
-    revoked_at TIMESTAMP WITH TIME ZONE
-);
-
-CREATE INDEX idx_refresh_tokens_user ON refresh_tokens(user_id);
-CREATE INDEX idx_refresh_tokens_hash ON refresh_tokens(token_hash);
 ```
 
 ### Authentication and Authorization
@@ -1892,11 +2641,11 @@ class JwtAuthenticationFilter(
 ```
 
 
-### Cloud Storage Strategy
+### Cloud Storage Strategy (AWS S3 + CloudFront)
 
 #### Image Storage
 
-**Storage Structure**:
+**S3 Bucket Structure**:
 ```
 s3://agriedge-images/
 ├── diagnoses/
@@ -1907,52 +2656,148 @@ s3://agriedge-images/
 │   │   │   │   └── {diagnosis_id}_thumb.jpg
 ```
 
-**Upload Flow**:
-1. Mobile app captures image
-2. Compress image (JPEG quality 85%, max dimension 1024px)
-3. Generate thumbnail (256x256)
-4. Request presigned URL from backend
-5. Upload directly to S3 using presigned URL
-6. Send diagnosis metadata to backend with S3 URL
+**S3 Bucket Configuration**:
+```python
+import boto3
 
-**Presigned URL Generation**:
-```kotlin
-class ImageStorageService(
-    private val s3Client: S3Client,
-    private val bucketName: String
-) {
-    
-    fun generateUploadUrl(
-        userId: String,
-        diagnosisId: String,
-        contentType: String
-    ): PresignedUploadUrl {
-        val key = generateKey(userId, diagnosisId)
-        
-        val putObjectRequest = PutObjectRequest.builder()
-            .bucket(bucketName)
-            .key(key)
-            .contentType(contentType)
-            .build()
-        
-        val presignRequest = PutObjectPresignRequest.builder()
-            .signatureDuration(Duration.ofMinutes(15))
-            .putObjectRequest(putObjectRequest)
-            .build()
-        
-        val presignedRequest = s3Presigner.presignPutObject(presignRequest)
-        
-        return PresignedUploadUrl(
-            uploadUrl = presignedRequest.url().toString(),
-            key = key,
-            expiresIn = 900
-        )
+s3_client = boto3.client('s3')
+
+# Create bucket with lifecycle policies
+s3_client.create_bucket(
+    Bucket='agriedge-images',
+    CreateBucketConfiguration={'LocationConstraint': 'ap-south-1'}  # Mumbai region
+)
+
+# Enable versioning
+s3_client.put_bucket_versioning(
+    Bucket='agriedge-images',
+    VersioningConfiguration={'Status': 'Enabled'}
+)
+
+# Set lifecycle policy (move to Glacier after 90 days)
+lifecycle_policy = {
+    'Rules': [
+        {
+            'Id': 'MoveToGlacier',
+            'Status': 'Enabled',
+            'Transitions': [
+                {
+                    'Days': 90,
+                    'StorageClass': 'GLACIER'
+                }
+            ],
+            'NoncurrentVersionTransitions': [
+                {
+                    'NoncurrentDays': 30,
+                    'StorageClass': 'GLACIER'
+                }
+            ]
+        }
+    ]
+}
+
+s3_client.put_bucket_lifecycle_configuration(
+    Bucket='agriedge-images',
+    LifecycleConfiguration=lifecycle_policy
+)
+
+# Enable server-side encryption
+s3_client.put_bucket_encryption(
+    Bucket='agriedge-images',
+    ServerSideEncryptionConfiguration={
+        'Rules': [
+            {
+                'ApplyServerSideEncryptionByDefault': {
+                    'SSEAlgorithm': 'AES256'
+                }
+            }
+        ]
     }
+)
+```
+
+**Upload Flow with Presigned URLs**:
+1. Mobile app requests presigned URL from Lambda
+2. Lambda generates presigned URL (15-minute expiration)
+3. App uploads directly to S3 using presigned URL
+4. App sends diagnosis metadata to API with S3 URL
+
+**Presigned URL Generation (Lambda)**:
+```python
+import boto3
+from datetime import timedelta
+
+s3_client = boto3.client('s3')
+
+def generate_presigned_upload_url(user_id: str, diagnosis_id: str) -> dict:
+    """
+    Generate presigned URL for image upload
+    """
+    key = f"diagnoses/{user_id}/{datetime.now().year}/{datetime.now().month}/{diagnosis_id}.jpg"
     
-    private fun generateKey(userId: String, diagnosisId: String): String {
-        val now = LocalDateTime.now()
-        return "diagnoses/$userId/${now.year}/${now.monthValue}/$diagnosisId.jpg"
+    presigned_url = s3_client.generate_presigned_url(
+        'put_object',
+        Params={
+            'Bucket': 'agriedge-images',
+            'Key': key,
+            'ContentType': 'image/jpeg'
+        },
+        ExpiresIn=900  # 15 minutes
+    )
+    
+    return {
+        'upload_url': presigned_url,
+        'key': key,
+        'expires_in': 900
     }
+
+def lambda_handler(event, context):
+    body = json.loads(event['body'])
+    user_id = body['user_id']
+    diagnosis_id = body['diagnosis_id']
+    
+    result = generate_presigned_upload_url(user_id, diagnosis_id)
+    
+    return {
+        'statusCode': 200,
+        'body': json.dumps(result)
+    }
+```
+
+**CloudFront Distribution**:
+```python
+cloudfront_client = boto3.client('cloudfront')
+
+# Create CloudFront distribution for S3 bucket
+distribution_config = {
+    'CallerReference': str(time.time()),
+    'Comment': 'AgriEdge Images CDN',
+    'Enabled': True,
+    'Origins': {
+        'Quantity': 1,
+        'Items': [
+            {
+                'Id': 'S3-agriedge-images',
+                'DomainName': 'agriedge-images.s3.ap-south-1.amazonaws.com',
+                'S3OriginConfig': {
+                    'OriginAccessIdentity': 'origin-access-identity/cloudfront/XXXXX'
+                }
+            }
+        ]
+    },
+    'DefaultCacheBehavior': {
+        'TargetOriginId': 'S3-agriedge-images',
+        'ViewerProtocolPolicy': 'redirect-to-https',
+        'AllowedMethods': {
+            'Quantity': 2,
+            'Items': ['GET', 'HEAD']
+        },
+        'Compress': True,
+        'MinTTL': 0,
+        'DefaultTTL': 86400,  # 1 day
+        'MaxTTL': 31536000  # 1 year
+    },
+    'PriceClass': 'PriceClass_200'  # Use edge locations in India and Asia
 }
 ```
 
@@ -1986,18 +2831,117 @@ s3://agriedge-models/
 }
 ```
 
-**Model Update API**:
+**Model Update API (Lambda)**:
+```python
+def lambda_handler(event, context):
+    """
+    Get latest model metadata
+    """
+    s3_client = boto3.client('s3')
+    
+    # Get latest model metadata from S3
+    response = s3_client.get_object(
+        Bucket='agriedge-models',
+        Key='production/latest.json'
+    )
+    
+    metadata = json.loads(response['Body'].read())
+    
+    # Generate CloudFront URL for download
+    metadata['downloadUrl'] = f"https://cdn.agriedge.com/models/{metadata['version']}/model.tflite"
+    
+    return {
+        'statusCode': 200,
+        'body': json.dumps(metadata)
+    }
 ```
-GET /api/v1/models/latest
-Response:
-{
-  "version": "1.0.0",
-  "checksum": "sha256-hash",
-  "size": 45678901,
-  "downloadUrl": "https://cdn.agriedge.com/models/v1.0.0/model.tflite",
-  "releaseDate": "2024-01-15T00:00:00Z"
-}
-```
+
+### AWS Cost Estimation
+
+**Monthly Cost Breakdown (Moderate Scale: 10,000 active users)**
+
+#### Compute Costs
+- **AWS Lambda**:
+  - Requests: ~5M requests/month
+  - Duration: Avg 500ms, 512MB memory
+  - Cost: ~$25/month
+  
+- **API Gateway**:
+  - REST API calls: ~5M requests/month
+  - Cost: ~$17.50/month
+
+#### Storage Costs
+- **DynamoDB**:
+  - On-Demand pricing
+  - Storage: ~50GB
+  - Read/Write: ~10M reads, ~2M writes/month
+  - Cost: ~$150/month
+
+- **S3**:
+  - Standard storage: ~500GB (images)
+  - Glacier storage: ~2TB (old images)
+  - Requests: ~1M PUT, ~5M GET/month
+  - Cost: ~$30/month (Standard) + ~$8/month (Glacier)
+
+- **RDS PostgreSQL** (db.t3.medium):
+  - Instance: ~$60/month
+  - Storage: 100GB SSD
+  - Cost: ~$75/month
+
+#### AI/ML Costs
+- **Amazon Bedrock** (Claude 3 Sonnet):
+  - Input tokens: ~5M tokens/month
+  - Output tokens: ~2M tokens/month
+  - Cost: ~$60/month
+
+- **Amazon Q Business**:
+  - 100 users (farmers + support staff)
+  - Cost: ~$200/month
+
+- **Amazon Transcribe**:
+  - ~10,000 minutes/month
+  - Cost: ~$24/month
+
+- **Amazon Polly**:
+  - ~5M characters/month
+  - Cost: ~$20/month
+
+#### Data Transfer & CDN
+- **CloudFront**:
+  - Data transfer: ~1TB/month
+  - Requests: ~10M/month
+  - Cost: ~$85/month
+
+- **Data Transfer Out**:
+  - ~500GB/month
+  - Cost: ~$45/month
+
+#### Monitoring & Other Services
+- **CloudWatch**:
+  - Logs: ~50GB/month
+  - Metrics: Custom metrics
+  - Cost: ~$15/month
+
+- **SNS** (SMS for OTP):
+  - ~5,000 SMS/month
+  - Cost: ~$25/month
+
+- **ElastiCache** (Redis):
+  - cache.t3.micro
+  - Cost: ~$15/month
+
+**Total Estimated Monthly Cost: ~$854/month**
+
+**Cost Optimization Strategies**:
+1. Use Lambda reserved concurrency for predictable workloads
+2. Enable S3 Intelligent-Tiering for automatic cost optimization
+3. Use DynamoDB reserved capacity for base load
+4. Implement aggressive caching with CloudFront and ElastiCache
+5. Use Spot Instances for batch processing (SageMaker training)
+6. Enable S3 Transfer Acceleration only for critical uploads
+7. Use AWS Savings Plans for 1-year commitment (30% savings)
+
+**Estimated Cost at Scale (100,000 users): ~$4,500/month**
 
 ### Data Synchronization Service
 
@@ -3772,6 +4716,52 @@ class SecurityTest {
 
 ## Deployment Considerations
 
+### Implementation Roadmap
+
+**Phase 1: Hackathon MVP (2-3 weeks)**
+
+Focus: Core diagnostic functionality with AWS AI services
+
+- [ ] Android app with camera integration
+- [ ] TFLite model integration for offline diagnosis
+- [ ] Basic UI with Jetpack Compose
+- [ ] AWS Lambda functions for auth and sync
+- [ ] DynamoDB tables for user data and diagnoses
+- [ ] S3 storage for images
+- [ ] Amazon Bedrock integration for treatment recommendations
+- [ ] Amazon Transcribe/Polly for voice interface
+- [ ] Basic Amazon Q chatbot integration
+
+**Phase 2: Beta Release (4-6 weeks)**
+
+Focus: Market connectivity and enhanced features
+
+- [ ] Beckn/ONDC integration for market search
+- [ ] Transaction management
+- [ ] Provider ratings and reviews
+- [ ] Enhanced voice interface with command parsing
+- [ ] Multi-language support (6 Indian languages)
+- [ ] Offline sync queue implementation
+- [ ] CloudFront CDN setup
+- [ ] Amazon QuickSight dashboards for impact tracking
+- [ ] Property-based testing implementation
+- [ ] Security hardening (encryption, TLS)
+
+**Phase 3: Production Scale (8-12 weeks)**
+
+Focus: Scalability, reliability, and advanced features
+
+- [ ] SageMaker pipelines for demand forecasting
+- [ ] Advanced Amazon Q knowledge base with agricultural documents
+- [ ] Performance optimization (caching, compression)
+- [ ] Comprehensive monitoring and alerting
+- [ ] Disaster recovery setup
+- [ ] Load testing and capacity planning
+- [ ] User onboarding and training materials
+- [ ] Support infrastructure
+- [ ] Analytics and reporting
+- [ ] Continuous model improvement pipeline
+
 ### Android App Distribution
 
 **Release Channels**:
@@ -3788,38 +4778,242 @@ class SecurityTest {
 - [ ] Localization verified for all languages
 - [ ] ProGuard/R8 configuration tested
 - [ ] APK size within limits (<150MB)
-- [ ] Crash reporting configured
-- [ ] Analytics configured
+- [ ] Crash reporting configured (Firebase Crashlytics)
+- [ ] Analytics configured (Firebase Analytics)
 - [ ] Release notes prepared
 
-### Backend Deployment
+### Backend Deployment (AWS)
 
-**Infrastructure**:
-- **Environment**: Kubernetes cluster (EKS or GKE)
-- **Scaling**: Horizontal pod autoscaling based on CPU/memory
-- **Database**: PostgreSQL with read replicas
-- **Cache**: Redis cluster
-- **Load Balancer**: Application Load Balancer with health checks
+**Infrastructure as Code (Terraform)**:
+
+```hcl
+# main.tf
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = "ap-south-1"  # Mumbai
+}
+
+# Lambda functions
+resource "aws_lambda_function" "auth_lambda" {
+  filename      = "auth_lambda.zip"
+  function_name = "agriedge-auth"
+  role          = aws_iam_role.lambda_role.arn
+  handler       = "index.lambda_handler"
+  runtime       = "python3.11"
+  timeout       = 30
+  memory_size   = 512
+
+  environment {
+    variables = {
+      DYNAMODB_TABLE = aws_dynamodb_table.users.name
+      SNS_TOPIC_ARN  = aws_sns_topic.otp.arn
+    }
+  }
+}
+
+# DynamoDB tables
+resource "aws_dynamodb_table" "users" {
+  name           = "Users"
+  billing_mode   = "PAY_PER_REQUEST"
+  hash_key       = "user_id"
+
+  attribute {
+    name = "user_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "phone_number"
+    type = "S"
+  }
+
+  global_secondary_index {
+    name            = "PhoneNumberIndex"
+    hash_key        = "phone_number"
+    projection_type = "ALL"
+  }
+
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  tags = {
+    Environment = "production"
+    Application = "agriedge"
+  }
+}
+
+# S3 buckets
+resource "aws_s3_bucket" "images" {
+  bucket = "agriedge-images"
+
+  tags = {
+    Environment = "production"
+    Application = "agriedge"
+  }
+}
+
+resource "aws_s3_bucket_versioning" "images_versioning" {
+  bucket = aws_s3_bucket.images.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+# CloudFront distribution
+resource "aws_cloudfront_distribution" "cdn" {
+  enabled = true
+  comment = "AgriEdge CDN"
+
+  origin {
+    domain_name = aws_s3_bucket.images.bucket_regional_domain_name
+    origin_id   = "S3-agriedge-images"
+
+    s3_origin_config {
+      origin_access_identity = aws_cloudfront_origin_access_identity.oai.cloudfront_access_identity_path
+    }
+  }
+
+  default_cache_behavior {
+    allowed_methods  = ["GET", "HEAD"]
+    cached_methods   = ["GET", "HEAD"]
+    target_origin_id = "S3-agriedge-images"
+
+    forwarded_values {
+      query_string = false
+      cookies {
+        forward = "none"
+      }
+    }
+
+    viewer_protocol_policy = "redirect-to-https"
+    min_ttl                = 0
+    default_ttl            = 86400
+    max_ttl                = 31536000
+    compress               = true
+  }
+
+  price_class = "PriceClass_200"
+
+  restrictions {
+    geo_restriction {
+      restriction_type = "whitelist"
+      locations        = ["IN"]  # India only
+    }
+  }
+
+  viewer_certificate {
+    cloudfront_default_certificate = true
+  }
+}
+
+# API Gateway
+resource "aws_apigatewayv2_api" "api" {
+  name          = "agriedge-api"
+  protocol_type = "HTTP"
+
+  cors_configuration {
+    allow_origins = ["*"]
+    allow_methods = ["GET", "POST", "PUT", "DELETE"]
+    allow_headers = ["*"]
+  }
+}
+```
 
 **Deployment Strategy**:
-- **Blue-Green Deployment**: Zero-downtime deployments
-- **Canary Releases**: Gradual rollout to subset of users
-- **Rollback Plan**: Automated rollback on error rate threshold
+- **Blue-Green Deployment**: Zero-downtime deployments using Lambda aliases
+- **Canary Releases**: Gradual rollout to subset of users (10% → 50% → 100%)
+- **Rollback Plan**: Automated rollback on error rate threshold (>1%)
+
+**CI/CD Pipeline (GitHub Actions)**:
+
+```yaml
+# .github/workflows/deploy.yml
+name: Deploy to AWS
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1
+      
+      - name: Run tests
+        run: |
+          python -m pytest tests/
+      
+      - name: Package Lambda functions
+        run: |
+          cd lambda
+          zip -r auth_lambda.zip auth/
+          zip -r sync_lambda.zip sync/
+      
+      - name: Deploy with Terraform
+        run: |
+          terraform init
+          terraform plan
+          terraform apply -auto-approve
+      
+      - name: Update Lambda functions
+        run: |
+          aws lambda update-function-code \
+            --function-name agriedge-auth \
+            --zip-file fileb://lambda/auth_lambda.zip
+      
+      - name: Run smoke tests
+        run: |
+          python scripts/smoke_tests.py
+```
 
 **Monitoring**:
 - **Metrics**: Request rate, error rate, latency (p50, p95, p99)
-- **Alerts**: Error rate > 1%, latency p95 > 1s, database connection pool exhausted
+- **Alerts**: 
+  - Error rate > 1%
+  - Latency p95 > 1s
+  - DynamoDB throttling
+  - Lambda concurrent executions > 80% of limit
 - **Dashboards**: Real-time system health, user activity, API performance
 
 ### Disaster Recovery
 
 **Backup Strategy**:
-- **Database**: Daily full backups, hourly incremental backups
-- **Retention**: 30 days for production, 7 days for staging
+- **DynamoDB**: Point-in-time recovery enabled (35-day retention)
+- **S3**: Versioning enabled, cross-region replication to ap-southeast-1 (Singapore)
+- **RDS**: Automated daily backups, 30-day retention
 - **Testing**: Monthly restore tests
 
 **Recovery Procedures**:
 - **RTO** (Recovery Time Objective): 4 hours
 - **RPO** (Recovery Point Objective): 1 hour
-- **Failover**: Automated failover to secondary region
+- **Failover**: Multi-region setup with Route 53 health checks
+
+**Multi-Region Architecture**:
+```
+Primary Region: ap-south-1 (Mumbai)
+Secondary Region: ap-southeast-1 (Singapore)
+
+Route 53 → Health Check → Primary Region (Active)
+                       → Secondary Region (Standby)
+```
 
